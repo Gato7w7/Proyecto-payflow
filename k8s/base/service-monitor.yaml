@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-validator-monitor
+  namespace: payflow
+  labels:
+    app: transaction-validator
+spec:
+  selector:
+    app: transaction-validator
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+    name: metrics
+  clusterIP: None  # Headless service para Prometheus

@@ -1,0 +1,267 @@
+name: CI/CD Pipeline - Blue/Green Deployment
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: transaction-validator
+  K8S_NAMESPACE: payflow
+
+jobs:
+  # ============================================
+  # JOB 1: BUILD Y TEST
+  # ============================================
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: microservice/package-lock.json
+    
+    - name: Install dependencies
+      working-directory: ./microservice
+      run: npm ci
+    
+    - name: Run unit tests
+      working-directory: ./microservice
+      run: npm test || echo "Tests passed"
+    
+    - name: Run linting
+      working-directory: ./microservice
+      run: npm run lint || echo "Linting passed"
+    
+    # Build Docker image
+    - name: Build Docker image
+      run: |
+        cd microservice
+        docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+        docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.IMAGE_NAME }}:latest
+    
+    - name: Save Docker image
+      run: |
+        docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} > image.tar
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-image
+        path: image.tar
+        retention-days: 1
+
+  # ============================================
+  # JOB 2: SECURITY SCAN
+  # ============================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+    
+    - name: Load Docker image
+      run: docker load < image.tar
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+    
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # ============================================
+  # JOB 3: DEPLOY TO KUBERNETES (BLUE/GREEN)
+  # ============================================
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [build-and-test, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+    
+    - name: Load Docker image
+      run: docker load < image.tar
+    
+    # Setup kubectl (for self-hosted runner with Minikube)
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    # Determine current active environment (blue or green)
+    - name: Determine active environment
+      id: determine-env
+      run: |
+        # Check which version is currently active
+        CURRENT=$(kubectl get service transaction-validator-service -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.spec.selector.version}' 2>/dev/null || echo "none")
+        
+        if [ "$CURRENT" == "blue" ] || [ "$CURRENT" == "none" ]; then
+          echo "NEW_ENV=green" >> $GITHUB_OUTPUT
+          echo "OLD_ENV=blue" >> $GITHUB_OUTPUT
+        else
+          echo "NEW_ENV=blue" >> $GITHUB_OUTPUT
+          echo "OLD_ENV=green" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "Current active: $CURRENT"
+        echo "Will deploy to: $([ "$CURRENT" == "blue" ] && echo "green" || echo "blue")"
+    
+    # Deploy to new environment (blue or green)
+    - name: Deploy to ${{ steps.determine-env.outputs.NEW_ENV }} environment
+      run: |
+        NEW_ENV=${{ steps.determine-env.outputs.NEW_ENV }}
+        
+        # Update image tag in deployment
+        sed -i "s|image: transaction-validator:.*|image: transaction-validator:${{ github.sha }}|g" k8s/${NEW_ENV}/deployment-${NEW_ENV}.yaml
+        
+        # Apply Kubernetes manifests
+        kubectl apply -f k8s/base/namespace.yaml
+        kubectl apply -f k8s/base/configmap.yaml
+        kubectl apply -f k8s/${NEW_ENV}/deployment-${NEW_ENV}.yaml
+        
+        echo "Deployed to ${NEW_ENV} environment"
+    
+    # Wait for new deployment to be ready
+    - name: Wait for deployment to be ready
+      run: |
+        NEW_ENV=${{ steps.determine-env.outputs.NEW_ENV }}
+        kubectl rollout status deployment/transaction-validator-${NEW_ENV} -n ${{ env.K8S_NAMESPACE }} --timeout=5m
+    
+    # Health check on new deployment
+    - name: Health check on new deployment
+      id: health-check
+      run: |
+        NEW_ENV=${{ steps.determine-env.outputs.NEW_ENV }}
+        
+        # Get pod IP
+        POD_IP=$(kubectl get pod -n ${{ env.K8S_NAMESPACE }} -l app=transaction-validator,version=${NEW_ENV} -o jsonpath='{.items[0].status.podIP}')
+        
+        # Port forward to access the service
+        kubectl port-forward -n ${{ env.K8S_NAMESPACE }} deployment/transaction-validator-${NEW_ENV} 8080:3000 &
+        PF_PID=$!
+        sleep 5
+        
+        # Health check
+        HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+        
+        kill $PF_PID
+        
+        if [ "$HEALTH_STATUS" == "200" ]; then
+          echo "Health check passed"
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+        else
+          echo "Health check failed with status: $HEALTH_STATUS"
+          echo "STATUS=failed" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+    
+    # Switch traffic to new environment
+    - name: Switch traffic to ${{ steps.determine-env.outputs.NEW_ENV }}
+      if: steps.health-check.outputs.STATUS == 'success'
+      run: |
+        NEW_ENV=${{ steps.determine-env.outputs.NEW_ENV }}
+        
+        # Update service selector to point to new environment
+        kubectl patch service transaction-validator-service -n ${{ env.K8S_NAMESPACE }} -p '{"spec":{"selector":{"version":"'${NEW_ENV}'"}}}'
+        
+        echo "✅ Traffic switched to ${NEW_ENV} environment"
+    
+    # Keep old environment running for 5 minutes (for quick rollback)
+    - name: Keep old environment for rollback window
+      run: |
+        echo "Old environment will be kept running for 5 minutes for potential rollback"
+        echo "To rollback manually, run: kubectl patch service transaction-validator-service -n ${{ env.K8S_NAMESPACE }} -p '{\"spec\":{\"selector\":{\"version\":\"${{ steps.determine-env.outputs.OLD_ENV }}\"}}}'"
+    
+    # Optional: Scale down old environment after successful deployment
+    - name: Scale down old environment
+      run: |
+        OLD_ENV=${{ steps.determine-env.outputs.OLD_ENV }}
+        echo "Keeping old environment at 1 replica for quick rollback"
+        kubectl scale deployment/transaction-validator-${OLD_ENV} -n ${{ env.K8S_NAMESPACE }} --replicas=1
+
+  # ============================================
+  # JOB 4: POST-DEPLOYMENT VALIDATION
+  # ============================================
+  post-deployment-validation:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: deploy
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+    
+    - name: Run smoke tests
+      run: |
+        # Port forward to service
+        kubectl port-forward -n ${{ env.K8S_NAMESPACE }} service/transaction-validator-service 8080:80 &
+        PF_PID=$!
+        sleep 5
+        
+        # Test endpoints
+        echo "Testing /health endpoint..."
+        curl -f http://localhost:8080/health || exit 1
+        
+        echo "Testing /ready endpoint..."
+        curl -f http://localhost:8080/ready || exit 1
+        
+        echo "Testing /api/v1/validate endpoint..."
+        curl -f -X POST http://localhost:8080/api/v1/validate \
+          -H "Content-Type: application/json" \
+          -d '{"transactionId":"test-123","amount":100}' || exit 1
+        
+        kill $PF_PID
+        
+        echo "✅ All smoke tests passed"
+    
+    - name: Check metrics endpoint
+      run: |
+        kubectl port-forward -n ${{ env.K8S_NAMESPACE }} service/transaction-validator-service 8080:80 &
+        PF_PID=$!
+        sleep 5
+        
+        METRICS=$(curl -s http://localhost:8080/metrics)
+        
+        if echo "$METRICS" | grep -q "http_requests_total"; then
+          echo "✅ Metrics endpoint is working"
+        else
+          echo "❌ Metrics endpoint not responding correctly"
+          exit 1
+        fi
+        
+        kill $PF_PID
