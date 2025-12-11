@@ -2,7 +2,7 @@
 
 Microservicio crítico de validación de transacciones para PayFlow MX con observabilidad completa.
 
-##Arquitectura
+## Arquitectura
 
 - **Microservicio**: Node.js + Express
 - **Métricas**: Prometheus
